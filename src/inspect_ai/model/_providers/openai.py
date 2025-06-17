@@ -4,7 +4,6 @@ import tempfile
 from logging import getLogger
 from typing import Any, Literal
 
-import anyio.abc
 import httpx
 from openai import (
     AsyncAzureOpenAI,
@@ -22,7 +21,7 @@ from inspect_ai._util.error import PrerequisiteError
 from inspect_ai._util.logger import warn_once
 from inspect_ai.model._openai import chat_choices_from_openai
 from inspect_ai.model._providers.openai_responses import generate_responses
-from inspect_ai.model._providers.util.batch import Batcher, BatchRequest, BatchResult
+from inspect_ai.model._providers.util.batch import Batch, Batcher, BatchRequest
 from inspect_ai.model._providers.util.hooks import HttpxHooks
 from inspect_ai.tool import ToolChoice, ToolInfo
 
@@ -110,8 +109,9 @@ class OpenAIBatcher(Batcher[ChatCompletion]):
         )
         return batch_info.id
 
-    async def _check_batch(self, batch_id: str) -> BatchResult:
-        batch_info = await self.client.batches.retrieve(batch_id)
+    async def _check_batch(self, batch: Batch[ChatCompletion]) -> None:
+        assert batch.id is not None
+        batch_info = await self.client.batches.retrieve(batch.id)
         batch_file_ids: list[str] = []
         if batch_info.status in {"completed", "failed", "cancelled", "expired"}:
             if batch_info.output_file_id is not None:
@@ -119,29 +119,23 @@ class OpenAIBatcher(Batcher[ChatCompletion]):
             if batch_info.error_file_id is not None:
                 batch_file_ids.append(batch_info.error_file_id)
 
-        return BatchResult(
-            id=batch_id,
-            status=batch_info.status,
-            result_uris=batch_file_ids,
-        )
+        batch.status = batch_info.status
+        batch.result_uris = batch_file_ids
 
     async def _handle_batch_result(
         self,
-        batch_result: BatchResult,
+        batch: Batch[ChatCompletion],
         idx_result_uri: int,
-        batch: dict[str, anyio.abc.ObjectSendStream[ChatCompletion | Exception]],
     ) -> None:
-        batch_file = await self.client.files.content(
-            batch_result.result_uris[idx_result_uri]
-        )
+        batch_file = await self.client.files.content(batch.result_uris[idx_result_uri])
         for line in (await batch_file.aread()).decode().splitlines():
             result: dict[str, Any] = json.loads(line)
             request_id = result.pop("custom_id")
             if not request_id:
                 continue
 
-            send_stream = batch.pop(request_id)
-            await send_stream.send(
+            batch_request = batch.requests.pop(request_id)
+            await batch_request.result_stream.send(
                 ChatCompletion.model_validate(result["response"]["body"])
                 if (error := result.get("error")) is None
                 else self.client._make_status_error_from_response(  # pyright: ignore[reportPrivateUsage]
